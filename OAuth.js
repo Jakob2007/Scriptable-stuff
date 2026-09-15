@@ -2,71 +2,239 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: light-gray; icon-glyph: fingerprint;
 
+// This verion of OAuth will open a WebView in Scriptable where the user can authenticate. When successful the redirect back will be intercepted thereby getting the code. This became nesseccary since using the scriptable uri scriptable:///run/OAuthCode is nolonger permited in this context
+
+// Arbitrary port for redirection -> Port will never be reached because it is intercepted
+const PORT = 8888;
+
 //Possible Values for authType
 const possibleAuthTypes = ["Web Application Flow", "PKCE"];
 
+const wv = new WebView();
+
+// Success Page that will be loaded since webview cannot be closed directly
+const successPage = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<style>
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+    background: #ffffff;
+    color: #111111;
+  }
+
+  .container {
+    text-align: center;
+    padding: 32px;
+    max-width: 340px;
+  }
+
+  .icon {
+    width: 78px;
+    height: 78px;
+    margin: 0 auto 22px;
+    border-radius: 50%;
+    background: #34c759;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 8px 25px rgba(52, 199, 89, 0.25);
+  }
+
+  .check {
+    color: white;
+    font-size: 43px;
+    font-weight: 600;
+    line-height: 1;
+    transform: translateY(-2px);
+  }
+
+  h1 {
+    margin: 0 0 10px;
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.6px;
+  }
+
+  p {
+    margin: 0;
+    color: #777777;
+    font-size: 16px;
+    line-height: 1.45;
+  }
+</style>
+</head>
+
+<body>
+  <div class="container">
+    <div class="icon">
+      <div class="check">✓</div>
+    </div>
+
+    <h1>Success</h1>
+    <p>Please close the WebView in the top right to continue.</p>
+  </div>
+</body>
+</html>
+`;
+
 // A function to open the OAuth Authentication URL in Safari
 // It also generated the code Verifier String and the code Challenge
-function openAuthUrl(global) {
+async function openAuthUrl(global) {
+    // Generate a random TCP port for the loopback redirect.
+    // Nothing actually listens on this port: the WebView intercepts
+    // the navigation before it reaches the network.
+    const redirectUri = `http://127.0.0.1:${PORT}/callback`;
+
+    global.redirectUri = redirectUri;
+
+    // Generate PKCE verifier.
     const generateRandomString = (length) => {
-        const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-        const values = Array.from({
-            length
-        }, () => Math.floor(Math.random() * 256));
-        return values.reduce((acc, x) => acc + possible[x % possible.length], "");
+        const possible =
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+
+        const values = Array.from(
+            { length },
+            () => Math.floor(Math.random() * 256)
+        );
+
+        return values
+            .map(x => possible[x % possible.length])
+            .join('');
+    };
+
+    // Generate and store PKCE verifier.
+    const codeVerifier = generateRandomString(64);
+    Keychain.set(`${global.app}_codeVerifier`, codeVerifier);
+
+    // Generate PKCE challenge.
+    const sha256 = importModule("sha256");
+    const shaObj = new sha256('SHA-256', 'TEXT');
+    shaObj.update(codeVerifier);
+
+    const codeChallenge = shaObj
+        .getHash('B64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
+
+    // Generate state.
+    const state = generateRandomString(32);
+
+    Keychain.set(`${global.app}_oauthState`, state);
+
+    // Build the Spotify authorization URL.
+    const params = {
+        response_type: 'code',
+        client_id: global.clientId,
+        scope: global.scope,
+        code_challenge_method: 'S256',
+        code_challenge: codeChallenge,
+        redirect_uri: redirectUri,
+        state: state
+    };
+
+    const query = Object.keys(params)
+        .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
+        .join('&');
+
+    const authUrl = `${global.authEndpoint}?${query}`;
+
+    global.log(`Redirect URI: ${redirectUri}`);
+    global.log(`Authorization URL: ${authUrl}`);
+
+    // Variable populated when the WebView attempts to navigate
+    // to our loopback callback.
+    let callbackUrl = null;
+
+    const webView = new WebView();
+
+    webView.shouldAllowRequest = request => {
+        const url = request.url;
+
+        global.log(`WebView request: ${url}`);
+
+        // Only intercept the exact loopback endpoint we created.
+        if (url.startsWith(`${redirectUri}?`) ||
+            url === redirectUri) {
+
+            global.log(`OAuth callback intercepted: ${url}`);
+
+            callbackUrl = url;
+
+            webView.loadHTML(successPage);
+
+            // IMPORTANT:
+            // Do not actually make the request to 127.0.0.1.
+            return false;
+        }
+
+        return true;
+    };
+
+    // Load url.
+    await webView.loadURL(authUrl);
+
+    // Present the WebView.
+    //
+    // The user closes it after the callback is intercepted.
+    await webView.present(true);
+
+    if (!callbackUrl) {
+        throw new Error("OAuth authentication was cancelled.");
     }
 
-    if (global.authType == "Web Application Flow") {
+    // Parse the intercepted callback.
+    const queryString = callbackUrl.split("?")[1] || "";
+    const queryParameters = {};
 
-        // construct url with all the data
-        const params = {
-            response_type: 'code',
-            client_id: global.clientId,
-            scope: global.scope,
-            redirect_uri: global.redirectUri,
-            state: global.state
-        }
-        if (Object.keys(params).length > 0) {
-            global.authEndpoint += '?' + Object.keys(params).map(key => `${key}=${params[key]}`).join('&');
-        }
+    for (const parameter of queryString.split("&")) {
+        if (!parameter) continue;
 
-    } else {
+        const [key, ...valueParts] = parameter.split("=");
 
-        // Get the code verifier and save it
-        const codeVerifier = generateRandomString(64);
-        Keychain.set(`${global.app}_codeVerifier`, codeVerifier);
+        const value = valueParts.join("=");
 
-        // compute challenge with sha256 module by the jsSHA project
-        const sha256 = importModule("sha256");
-        const shaObj = new sha256('SHA-256', 'TEXT')
-        shaObj.update(codeVerifier);
-
-        const codeChallenge = shaObj.getHash('B64').replace(/=/g, '')
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_');
-
-        global.log(`Code Verifier: ${codeVerifier}`);
-
-        //construct url with all the data
-        const params = {
-            response_type: 'code',
-            client_id: global.clientId,
-            scope: global.scope,
-            code_challenge_method: 'S256',
-            code_challenge: codeChallenge,
-            redirect_uri: global.redirectUri,
-        }
-
-        if (Object.keys(params).length > 0) {
-            global.authEndpoint += '?' + Object.keys(params).map(key => `${key}=${params[key]}`).join('&');
-        }
+        queryParameters[decodeURIComponent(key)] =
+            decodeURIComponent(value.replace(/\+/g, " "));
     }
 
-    // open url in Safari
-    global.log(global.authEndpoint);
-    Safari.open(global.authEndpoint);
+    const code = queryParameters.code;
+    const returnedState = queryParameters.state;
+    const error = queryParameters.error;
 
-    Script.complete();
+    if (error) {
+        throw new Error(`OAuth error: ${error}`);
+    }
+
+    if (!code) {
+        throw new Error("The service did not return an authorization code.");
+    }
+
+    // Verify state.
+    const expectedState = Keychain.get(`${global.app}_oauthState`);
+
+    if (!returnedState || returnedState !== expectedState) {
+        throw new Error("OAuth state validation failed.");
+    }
+
+    // State is single-use.
+    Keychain.remove(`${global.app}_oauthState`);
+
+    global.log(`Authorization code received.`);
+
+    return code;
 }
 
 //This function converts an Object into url params
@@ -81,17 +249,19 @@ function encodeParams(params) {
     return Object.keys(params).map(key => `${key}=${myencodeURIComponent(params[key])}`).join('&');
 }
 
-//Here is the token Management like refreshing the access token, or getting the tokens from the initial code
 async function authManagement(global, code) {
 
-    //This function gets the access and refresh tokens with the code provided by the oauth login
     async function getInitToken(code) {
         if (global.authType == "Web Application Flow") {
-            const r = new Request(global.tokenEndpoint)
+
+            const r = new Request(global.tokenEndpoint);
+
             r.method = "POST";
+
             r.headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
             };
+
             r.body = encodeParams({
                 grant_type: 'authorization_code',
                 code: code,
@@ -103,8 +273,11 @@ async function authManagement(global, code) {
             return await r.loadJSON();
 
         } else {
-            const r = new Request(global.tokenEndpoint)
+
+            const r = new Request(global.tokenEndpoint);
+
             r.method = "POST";
+
             r.headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
             };
@@ -116,71 +289,100 @@ async function authManagement(global, code) {
                 redirect_uri: global.redirectUri,
                 code_verifier: Keychain.get(`${global.app}_codeVerifier`),
             });
+
             return await r.loadJSON();
         }
-
     }
 
-    // This function refreshes the access token with the refresh Token
     async function refreshToken(global) {
+
         const r = new Request(global.tokenEndpoint);
-        r.method = "POST"
+
+        r.method = "POST";
+
         r.headers = {
             'Content-Type': 'application/x-www-form-urlencoded'
-        }
+        };
+
         r.body = encodeParams({
             client_id: global.clientId,
             grant_type: 'refresh_token',
             refresh_token: global.currentToken.refresh_token
-        })
+        });
+
         return await r.loadJSON();
     }
 
-    // Here is the logic of when to do what with the tokens
-    if (global.currentToken && (global.currentToken.expires && new Date(global.currentToken.expires) > new Date())) {
-        // Token is still valid -> Do nothing
+    // Existing token is still valid.
+    if (
+        global.currentToken &&
+        global.currentToken.expires &&
+        new Date(global.currentToken.expires) > new Date()
+    ) {
         global.log('Token is still valid');
-    } else {
-        global.log('Token is expired');
-        // Token is expired! We have to do something
-        if (global.currentToken.refresh_token) {
-            global.log('Refreshing token');
-            // If we have a refresh token, use it to get a new access token
-            const response = await refreshToken(global);
-            // Save the new access token
-            global.currentToken = response;
-            saveToken(global)
-        } else {
-            global.log('Requesting new token');
-            // If we dont have a refresh Token, either have a login code from the login or we dont
+        return;
+    }
 
-            if (global.authType == "Web Application Flow") {
+    global.log('Token is expired or missing.');
 
-                if (!code) {
+    // Try refresh token first.
+    if (global.currentToken && global.currentToken.refresh_token) {
 
-                    infoAlert("Your Access Token is expired, please reauthenticate in Safari");
+        global.log('Refreshing token');
 
-                    openAuthUrl(global);
-                    Script.complete();
-                    return;
-                }
-            }
-            else {
-                if (!Keychain.contains(`${global.app}_codeVerifier`) || !code) {
-                    // If we dont have one, something went wrong -> We ask the user again to sign in in Safari
-                    errorAlert("No Code or codeVerifier found, please try again");
+        const response = await refreshToken(global);
 
-                    openAuthUrl(global);
-                    Script.complete();
-                    return;
-                }
-            }
+        global.currentToken = {
+            ...response,
+            refresh_token:
+                response.refresh_token ||
+                global.currentToken.refresh_token
+        };
 
-            // If we do have the code we use it to get the tokens
-            global.currentToken = await getInitToken(code);
-            infoAlert(JSON.stringify(global.currentToken, null, 2));
-            saveToken(global)
+        saveToken(global);
+        return;
+    }
+
+    // If we already have an authorization code, exchange it.
+    if (code) {
+
+        global.log('Exchanging authorization code');
+
+        global.currentToken = await getInitToken(code);
+
+        saveToken(global);
+        return;
+    }
+
+    // No token and no code -> start interactive OAuth.
+    global.log('Starting OAuth authentication.');
+
+    if (global.authType === "PKCE") {
+
+        const authorizationCode = await openAuthUrl(global);
+
+        global.currentToken = await getInitToken(authorizationCode);
+
+        saveToken(global);
+
+        // PKCE verifier has now served its purpose.
+        if (Keychain.contains(`${global.app}_codeVerifier`)) {
+            Keychain.remove(`${global.app}_codeVerifier`);
         }
+
+        return;
+    }
+
+    // Web Application Flow still needs its own handling.
+    if (global.authType === "Web Application Flow") {
+
+        const authorizationCode = await openAuthUrl(global);
+
+        global.currentToken = await getInitToken(authorizationCode);
+
+        saveToken(global);
+
+        return;
     }
 }
 
@@ -191,31 +393,6 @@ function getToken(global) {
 
 // This saves the current token to the Keychain and computes the exipiry date
 function saveToken(global) {
-    const token = global.currentToken;
-
-    if (!token.access_token) {
-        // If we have no access token, something went wrong! -> We try again by asking the user to sign in in Safari
-        global.log(token)
-        global.log('No access token in response, automaticly requesting new OAuth confirmation.');
-
-        errorAlert("No access token found, please try again");
-        openAuthUrl(global);
-        Script.complete();
-        return;
-    }
-
-    // We compute the absolute Expiry date from the relative one in the token response
-    const now = new Date();
-    const expiry = new Date(now.getTime() + (token.expires_in * 1000));
-
-    // We add the absolute expiry date to the token
-    const data = JSON.stringify({
-        ...token,
-        expires: expiry
-    });
-
-    // We save the token in the Keychain
-    Keychain.set(`${global.app}_token`, data);
 }
 
 
@@ -271,7 +448,7 @@ async function auth(config) {
     }
 
     if (old_config != null) {
-        if (compare("clientId") || compare("redirectUri") || compare("tokenEndpoint") || compare("authEndpoint") || compare("scope")) {
+        if (compare("clientId") || compare("tokenEndpoint") || compare("authEndpoint") || compare("scope")) {
             global.log("The Scope changed, reauthing user")
             // But first change the new config
             Keychain.set(`${global.app}_config`, JSON.stringify(global));
@@ -292,19 +469,6 @@ async function auth(config) {
 
     // return the valid access token
     return global.currentToken.access_token;
-}
-
-// This function called from the OAuthCode Script with the inital login Code and app name
-module.exports.codeReturn = async (code, app) => {
-    if (code) {
-        let global = JSON.parse(Keychain.get(`${app}_config`));
-
-        global.currentToken = {}
-        global.log = console.log
-
-        await authManagement(global, code);
-        return;
-    }
 }
 
 // Expose the auth function to other Scripts
